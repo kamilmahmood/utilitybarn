@@ -1,0 +1,31 @@
+fail_fast: true
+default_language_version:
+  python: python3.9
+minimum_pre_commit_version: "4.3.0"
+repos:
+  - repo: local
+    hooks:
+      - id: pytest-check
+        name: pytest
+        language: python
+        require_serial: true
+        pass_filenames: false
+        always_run: true
+        entry: pytest
+        args: [--tb=no]
+
+      - id: ruff-check
+        name: ruff check
+        language: python
+        require_serial: true
+        pass_filenames: false
+        always_run: true
+        entry: ruff check
+
+      - id: ruff-format
+        name: ruff format
+        language: python
+        require_serial: true
+        pass_filenames: false
+        always_run: true
+        entry: ruff format
