@@ -445,12 +445,19 @@ class ProcessParallel(object):
                 continue
 
             if self._inactivitytimeout != 0.0:
-                try:
-                    # Timeout 500 millis before actual time so that last sent is
-                    # set to slighlty before threshold to prevent extra warnings
-                    iq.put(item, timeout=max(0.1, self._inactivitytimeout - 0.5))
-                except queue.Full:
-                    self._lastsent = time.time()
+                while True:
+                    try:
+                        # Timeout 500 millis before actual time so that last sent is
+                        # set to slighlty before threshold to prevent extra warnings
+                        iq.put(item, timeout=max(0.1, self._inactivitytimeout - 0.5))
+                    except queue.Full:
+                        # Queue is full at the moment, try next time
+                        pass
+                    else:
+                        # Item successfully put into queue
+                        break
+                    finally:
+                        self._lastsent = time.time()
             else:
                 iq.put(item, block=True)
         self._inprunning = False
