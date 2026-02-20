@@ -284,13 +284,10 @@ class ProcessParallel(object):
         if mpctx is None:
             startmethod = multiprocessing.get_start_method()
             self._mpctx = multiprocessing.get_context(startmethod)
-            self._manager = self._mpctx.Manager()
         elif isinstance(mpctx, str):
             self._mpctx = multiprocessing.get_context(mpctx)
-            self._manager = mpctx.Manager()
         else:
             self._mpctx = mpctx
-            self._manager = mpctx.Manager()
         self._inactivitytimeout = inactivitytimeout
         self._pid = os.getpid()
         self._lock = threading.Lock()
@@ -301,6 +298,7 @@ class ProcessParallel(object):
         self._workers = None
         self._activity = None
         self._lastsent = None
+        self._manager = None
 
     def apply(self, func: Callable[Any, Any], it: Iterable[Any]) -> Iterable[Any]:
         """Run a `func` in parallel across multiple processes and consume results
@@ -343,6 +341,9 @@ class ProcessParallel(object):
             self._running = True
 
         try:
+            # Only create manager when processing is running
+            # TODO: Better cleanup in case of crash or kill signal
+            self._manager = self._mpctx.Manager()
             yield from self._apply(func, it)
         finally:
             self._cleanup()
@@ -354,6 +355,7 @@ class ProcessParallel(object):
             self._inprunning = False
             with self._lock:
                 self._running = False
+                self._manager = None
 
     def _apply(self, func: Callable[Any, Any], it: Iterable[Any]) -> Iterable[Any]:
         self._iq = self._manager.Queue(self._inpbuffsize)
@@ -492,6 +494,8 @@ class ProcessParallel(object):
         for worker in self._workers or []:
             worker.kill()
             worker.join()
+        if self._manager is not None:
+            self._manager.shutdown()
 
     @staticmethod
     def _run(
@@ -520,7 +524,7 @@ class ProcessParallel(object):
                 init(rank, logger)
         except Exception as ex:
             logger.exception(
-                f"Exception in rank: {rank} with pid {os.getpid()} during init: {ex}"
+                f"Exception in rank {rank} with pid {os.getpid()} during init: {ex}"
             )
             sys.exit(1)
 
