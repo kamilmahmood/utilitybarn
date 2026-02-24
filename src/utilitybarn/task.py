@@ -249,7 +249,8 @@ class ProcessParallel(object):
     Limitations
     -----------
     1. Workers that get killed due to external signals
-       or crashes are not restarted.
+       or crashes are not restarted and their inactivity
+       time is not updated
     2. No proper support for sharing tensors across
        processes.
     3. Same queue is used for logging and output which
@@ -414,9 +415,11 @@ class ProcessParallel(object):
                 pid = out.process
                 self._logger.handle(out)
                 # Update activity time to indicate that
-                # worker is doing something which is causing
-                # errors
-                self._activity[pid] = now
+                # worker is doing something which is generating
+                # logs. Do not update if worker has not received
+                # a new input yet.
+                if self._activity[pid] is not None:
+                    self._activity[pid] = now
             else:
                 pid, typ, value = out
                 if typ == ProcessParallel._RCVD_MESSAGE:
@@ -424,8 +427,11 @@ class ProcessParallel(object):
                     # and starting processing on it
                     self._activity[pid] = value
                 elif typ == ProcessParallel._OUT_MESSAGE:
-                    # Worker has sent the response back
-                    self._activity[pid] = now
+                    # Worker has sent the response back.
+                    # Set None to indicate that this worker
+                    # has nothing new to work with to suppress
+                    # inactivity logs
+                    self._activity[pid] = None
                     yield value
                 else:
                     raise ValueError(f"Invalid message type received: {typ!r}")
@@ -489,7 +495,7 @@ class ProcessParallel(object):
 
         for rank, (pid, lastrcvd) in enumerate(self._activity.items()):
             if lastrcvd is None:
-                # This worker has not recieved anything
+                # This worker has not recieved anything new yet
                 pass
             elif (diff := now - lastrcvd) > self._inactivitytimeout:
                 # Highlight case where consumer is slow
