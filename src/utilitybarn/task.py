@@ -42,6 +42,112 @@ class _AcceleratorStat:
     totalmem: int
 
 
+class _ParallelExecutorBase(object):
+    """Base class for parallel executors e.g.
+    ProcessParallel and ThreadParallel"""
+
+    def __init__(self, backend, inactivitytimeout: float, logger: logging.Logger):
+        super().__init__()
+        if type(self) is _ParallelExecutorBase:
+            raise TypeError(
+                f"{_ParallelExecutorBase.__class__.__name__} is an abstract base class and cannot be"
+                " instantiated directly. Use ProcessParallel or ThreadParallel instead."
+            )
+        self._backend = backend
+        self._inactivitytimeout = inactivitytimeout
+        self._logger = logger
+
+        # Mutable state
+        self._workers = None
+        self._activity = None
+        self._lastsent = None
+        self._inprunning = False
+
+    def _check_inactivity(self):
+        if self._inactivitytimeout == 0.0:
+            return
+        now = time.time()
+        lastsent = self._lastsent
+        if self._inprunning and (diff := now - lastsent) > self._inactivitytimeout:
+            # Highlight case where producer is slower
+            self._logger.warning(f"Nothing sent to workers in last {diff:.3f} seconds")
+
+        for rank, (id_, lastrcvd) in enumerate(self._activity.items()):
+            if lastrcvd is None:
+                # This worker has not recieved anything new yet
+                pass
+            elif (diff := now - lastrcvd) > self._inactivitytimeout:
+                typ = "tid" if self._backend == "mt" else "pid"
+                # Highlight case where consumer is slow
+                self._logger.warning(
+                    f"No activity from rank:{rank}, {typ}:{id_} in last {diff:.3f} seconds"
+                )
+
+    def _feed(
+        self, it: Iterable[Any], iq: Union[Queue, queue.Queue], oq: [Queue, queue.Queue]
+    ):
+        it = iter(it)
+        self._inprunning = True
+        self._lastsent = time.time()
+        while True:
+            try:
+                item = next(it)
+            except StopIteration:
+                break
+            except Exception as ex:
+                self._logger.error(f"Error while getting item from iterable: {ex}")
+                continue
+
+            if self._inactivitytimeout != 0.0:
+                while True:
+                    try:
+                        # Timeout 500 millis before actual time so that last sent is
+                        # set to slighlty before threshold to prevent extra warnings
+                        iq.put(item, timeout=max(0.1, self._inactivitytimeout - 0.5))
+                    except queue.Full:
+                        # Queue is full at the moment, try next time
+                        pass
+                    else:
+                        # Item successfully put into queue
+                        break
+                    finally:
+                        self._lastsent = time.time()
+            else:
+                iq.put(item, block=True)
+        self._inprunning = False
+
+        # Send kill pill to all workers because
+        # input is finished
+        for w in range(len(self._workers)):
+            iq.put(None)
+
+        for worker in self._workers:
+            worker.join()
+        oq.put(None, block=True)
+
+    def _cleanup(
+        self, manager: Optional[multiprocessing.Manager] = None, kbint: bool = False
+    ):
+        if self._workers is not None:
+            for worker in self._workers:
+                if self._backend == "mp":
+                    worker.kill()
+                    worker.join()
+                elif self._backend == "mt":
+                    # TODO: Fix leaky abstraction where parent is concerned
+                    # about child behaviour
+                    worker._utilitybarn_thread_worker_state._shoudstop = True
+                    if not kbint:
+                        # Only join if it is not KeyboardInterrupt
+                        worker.join()
+        if manager is not None:
+            manager.shutdown()
+        self._workers = None
+        self._activity = None
+        self._lastsent = None
+        self._inprunning = False
+
+
 def _get_cuda_stats_torch() -> List[_AcceleratorStat]:
     import torch
 
@@ -154,7 +260,7 @@ def gputasks(
     return available
 
 
-class ProcessParallel(object):
+class ProcessParallel(_ParallelExecutorBase):
     """
     Run tasks concurrently using multiple processes with controlled buffering,
     safe logging, and activity monitoring.
@@ -273,15 +379,14 @@ class ProcessParallel(object):
         mpctx: Union[BaseContext, str, None] = None,
         inactivitytimeout: float = 0.0,
     ):
-        super().__init__()
+        super().__init__("mp", inactivitytimeout, logger)
         if njobs <= 0:
             raise ValueError(f":njobs cannot be <1 but got {njobs}")
         self._njobs = njobs
         self._init = init
-        self._initargs = initargs
+        self._initargs = initargs or ()
         self._inpbuffsize = inpbuffsize
         self._outbuffsize = outbuffsize
-        self._logger = logger
         if mpctx is None:
             startmethod = multiprocessing.get_start_method()
             self._mpctx = multiprocessing.get_context(startmethod)
@@ -289,19 +394,15 @@ class ProcessParallel(object):
             self._mpctx = multiprocessing.get_context(mpctx)
         else:
             self._mpctx = mpctx
-        self._inactivitytimeout = inactivitytimeout
         self._pid = os.getpid()
         self._lock = threading.Lock()
         # Mutable state
         self._running = False
         self._iq = None
         self._oq = None
-        self._workers = None
-        self._activity = None
-        self._lastsent = None
         self._manager = None
 
-    def apply(self, func: Callable[Any, Any], it: Iterable[Any]) -> Iterable[Any]:
+    def apply(self, func: Callable[[Any], Any], it: Iterable[Any]) -> Iterable[Any]:
         """Run a `func` in parallel across multiple processes and consume results
         as they become available.
 
@@ -314,7 +415,7 @@ class ProcessParallel(object):
 
         Parameters
         ----------
-        func : Callable[Any, Any]
+        func : Callable[[Any], Any]
             The function to apply to each item. Must be picklable and safe to run
             in a separate process.
         it : Iterable[Any]
@@ -347,13 +448,9 @@ class ProcessParallel(object):
             self._manager = self._mpctx.Manager()
             yield from self._apply(func, it)
         finally:
-            self._cleanup()
+            self._cleanup(manager=self._manager)
             self._iq = None
             self._oq = None
-            self._workers = None
-            self._activity = None
-            self._lastsent = None
-            self._inprunning = False
             with self._lock:
                 self._running = False
                 self._manager = None
@@ -437,78 +534,12 @@ class ProcessParallel(object):
                     raise ValueError(f"Invalid message type received: {typ!r}")
             self._check_inactivity()
 
-    def _feed(self, it: Iterable[Any], iq: Queue, oq: Queue):
-        it = iter(it)
-        self._inprunning = True
-        self._lastsent = time.time()
-        while True:
-            try:
-                item = next(it)
-            except StopIteration:
-                break
-            except Exception as ex:
-                self._logger.error(f"Error while getting item from iterable: {ex}")
-                continue
-
-            if self._inactivitytimeout != 0.0:
-                while True:
-                    try:
-                        # Timeout 500 millis before actual time so that last sent is
-                        # set to slighlty before threshold to prevent extra warnings
-                        iq.put(item, timeout=max(0.1, self._inactivitytimeout - 0.5))
-                    except queue.Full:
-                        # Queue is full at the moment, try next time
-                        pass
-                    else:
-                        # Item successfully put into queue
-                        break
-                    finally:
-                        self._lastsent = time.time()
-            else:
-                iq.put(item, block=True)
-        self._inprunning = False
-
-        # Send kill pill to all workers because
-        # input is finished
-        for _ in range(len(self._workers)):
-            iq.put(None)
-
-        for worker in self._workers:
-            worker.join()
-        oq.put(None, block=True)
-
     def _ensure_pid(self):
         pid = os.getpid()
         if pid != self._pid:
             raise RuntimeError(
                 "Object can only be used from same process which created it"
             )
-
-    def _check_inactivity(self):
-        if self._inactivitytimeout == 0.0:
-            return
-        now = time.time()
-        lastsent = self._lastsent
-        if self._inprunning and (diff := now - lastsent) > self._inactivitytimeout:
-            # Highlight case where producer is slower
-            self._logger.warning(f"Nothing sent to workers in last {diff:.3f} seconds")
-
-        for rank, (pid, lastrcvd) in enumerate(self._activity.items()):
-            if lastrcvd is None:
-                # This worker has not recieved anything new yet
-                pass
-            elif (diff := now - lastrcvd) > self._inactivitytimeout:
-                # Highlight case where consumer is slow
-                self._logger.warning(
-                    f"No activity from rank:{rank}, pid:{pid} in last {diff:.3f} seconds"
-                )
-
-    def _cleanup(self):
-        for worker in self._workers or []:
-            worker.kill()
-            worker.join()
-        if self._manager is not None:
-            self._manager.shutdown()
 
     @staticmethod
     def _run(
@@ -519,7 +550,7 @@ class ProcessParallel(object):
         iq: Queue,
         oq: Queue,
         init: Optional[Callable[[tuple[Any]], Any]],
-        initargs: Optional[tuple[Any]],
+        initargs: tuple[Any],
         func: Callable[[tuple[Any]], Any],
     ) -> NoReturn:
         ProcessParallel._setup_parent_death_action(ppid)
@@ -531,10 +562,8 @@ class ProcessParallel(object):
 
         logger = ProcessParallel._setup_logger(loglevel, oq)
         try:
-            if init is not None and initargs is not None:
+            if init is not None:
                 init(rank, logger, *initargs)
-            elif init is not None:
-                init(rank, logger)
         except Exception as ex:
             logger.exception(
                 f"Exception in rank {rank} with pid {os.getpid()} during init: {ex}"
@@ -575,6 +604,255 @@ class ProcessParallel(object):
         handler.setLevel(loglevel)
         logger.addHandler(handler)
         return logger
+
+
+class ThreadState(object):
+    """
+    Object of this class will be passed
+    worker threads to keep their state
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._shoudstop = False
+
+    def shouldstop(self) -> bool:
+        """Check whether worker thread should stop or not.
+        It is to support collaborative terminate functionality
+        for thread
+        """
+        return self._shoudstop
+
+
+class ThreadParallel(_ParallelExecutorBase):
+    """
+    Run tasks concurrently using multiple threads with controlled buffering,
+    and activity monitoring.
+
+    This class provides functionality similar to `multiprocessing.pool.ThreadPool` and
+    `concurrent.futures.ThreadPoolExecutor`, but with several key differences:
+
+    1. **Bounded Buffers**
+       Input (`inpbuffsize`) and output (`outbuffsize`) queues are size limited
+       to reduce memory pressure and handle cases where producer and consumer
+       speeds differ significantly.
+
+    2. **Rank Awareness**
+       Each worker is assigned a number (rank), enabling scenarios
+       where workers must bind to specific hardware resources (e.g., GPUs).
+
+    3. **Inactivity Monitoring**
+       Both workers and the producer are monitored for inactivity via
+       `inactivitytimeout`. Warnings are issued when input or output stalls,
+       helping detect bottlenecks or deadlocks early.
+
+    Parameters
+    ----------
+    njobs : int
+        Number of worker threads to launch. Each worker runs tasks independently.
+        Example: `njobs=4` will use 4 threads concurrently.
+    init : Callable[[int, logging.Logger, ThreadState, ...], Any], optional
+        Optional initialization function called once per worker before processing
+        begins. Receives the worker's rank as first argument, logger and state object.
+        New attributes can added to state and it will be passed again with each input.
+    initargs : tuple[Any], optional
+        Extra arguments passed to the `init` function. Allows customization of
+        worker setup beyond rank and logger.
+    inpbuffsize : int, default=64
+        Maximum number of items buffered in the input queue. Lower values reduce
+        memory usage but may slow throughput if producers are fast.
+    outbuffsize : int, default=64
+        Maximum number of results buffered in the output queue. Lower values help
+        control memory pressure when consumers are slower than producers.
+    logger : logging.Logger, default=nolog()
+        Logger instance used by workers. Default logger logs are not printed.
+    inactivitytimeout : float, default=0.0
+        Maximum allowed inactivity (in seconds) for workers or producer before a
+        warning is logged. Set to >0.0 to detect stalls in input or output flow.
+
+    Example
+    -------
+    >>> from utilitybarn.log import stderr
+    >>> from utilitybarn.task import ThreadParallel
+    >>>
+    >>>
+    >>> def init(rank, logger, state):
+    >>>     state.rank = rank
+    >>>     state.logger = logger
+    >>>     logger.info(f"Worker with rank {rank}")
+    >>>
+    >>>
+    >>> def mul(state, args):
+    >>>     a, b = args
+    >>>     state.logger.info(f"Multiplying {a} and {b} in rank:{state.rank}")
+    >>>     return a * b
+    >>>
+    >>>
+    >>> p = ThreadParallel(njobs=4, init=init, logger=stderr())
+    >>> for res in p.apply(mul, [(20, 30), (40, 50)]):
+    >>>     print(res)
+    >>>
+
+    Limitations
+    -----------
+    1. Workers which crashes are not restarted
+       and their inactivity time is not updated.
+    2. Uses collaborative way to stop worker thread
+       instead of preemptive.
+    """
+
+    _RCVD_MESSAGE = "R"
+    _OUT_MESSAGE = "O"
+
+    def __init__(
+        self,
+        *,
+        njobs: int,
+        init: Optional[Callable[[int, logging.Logger, ThreadState, ...], Any]] = None,
+        initargs: Optional[tuple[Any]] = None,
+        inpbuffsize: int = 64,
+        outbuffsize: int = 64,
+        logger: logging.Logger = nolog(),
+        inactivitytimeout: float = 0.0,
+    ):
+        super().__init__("mt", inactivitytimeout, logger)
+        if njobs <= 0:
+            raise ValueError(f":njobs cannot be <1 but got {njobs}")
+        self._njobs = njobs
+        self._init = init
+        self._initargs = initargs or ()
+        self._inpbuffsize = inpbuffsize
+        self._outbuffsize = outbuffsize
+        self._lock = threading.Lock()
+
+        # Mutable state
+        self._running = False
+        self._iq = None
+        self._oq = None
+
+    def apply(
+        self, func: Callable[[ThreadState, Any], Any], it: Iterable[Any]
+    ) -> Iterable[Any]:
+        """Run a `func` in parallel across multiple threads and consume results."""
+        with self._lock:
+            if self._running:
+                raise RuntimeError("Already running")
+            self._running = True
+
+        kbint = False
+        try:
+            yield from self._apply(func, it)
+        except KeyboardInterrupt:
+            kbint = True
+            raise
+        finally:
+            self._cleanup(kbint=kbint)
+            self._iq = None
+            self._oq = None
+            with self._lock:
+                self._running = False
+
+    def _apply(
+        self, func: Callable[[ThreadState, Any], Any], it: Iterable[Any]
+    ) -> Iterable[Any]:
+        self._iq = queue.Queue(self._inpbuffsize)
+        self._oq = queue.Queue(self._outbuffsize)
+        self._workers = []
+
+        for rank in range(self._njobs):
+            state = ThreadState()
+            try:
+                worker = threading.Thread(
+                    target=ThreadParallel._run,
+                    args=(
+                        rank,
+                        self._logger,
+                        self._inactivitytimeout != 0.0,
+                        self._iq,
+                        self._oq,
+                        self._init,
+                        self._initargs,
+                        func,
+                    ),
+                    daemon=True,
+                )
+                worker._utilitybarn_thread_worker_state = state
+                worker.start()
+            except threading.ThreadError as ex:
+                raise TaskError(f"Unable to start thread of rank {rank}: {ex}")
+            self._workers.append(worker)
+
+        try:
+            feeder = threading.Thread(
+                target=self._feed,
+                args=(it, self._iq, self._oq),
+                daemon=True,
+            )
+            feeder.start()
+        except threading.ThreadError as ex:
+            raise TaskError(f"Unable to start feeder thread: {ex}")
+
+        self._activity = OrderedDict([(w.native_id, None) for w in self._workers])
+        while True:
+            try:
+                if self._inactivitytimeout != 0.0:
+                    out = self._oq.get(timeout=self._inactivitytimeout + 0.5)
+                else:
+                    out = self._oq.get(block=True)
+            except queue.Empty:
+                self._check_inactivity()
+                continue
+
+            if out is None:
+                break
+            pid, typ, value = out
+            if typ == ThreadParallel._RCVD_MESSAGE:
+                self._activity[pid] = value
+            elif typ == ThreadParallel._OUT_MESSAGE:
+                self._activity[pid] = None
+                yield value
+            else:
+                raise ValueError(f"Invalid message type received: {typ!r}")
+            self._check_inactivity()
+
+    @staticmethod
+    def _run(
+        rank: int,
+        logger: logging.Logger,
+        sendack: bool,
+        iq: queue.Queue,
+        oq: queue.Queue,
+        init: Optional[Callable[[int, logging.Logger, ThreadState, ...], Any]],
+        initargs: tuple[Any],
+        func: Callable[[ThreadState, Any], Any],
+    ):
+        state = threading.current_thread()._utilitybarn_thread_worker_state
+        try:
+            if init is not None:
+                init(rank, logger, state, *initargs)
+        except Exception as ex:
+            logger.exception(f"Exception in rank {rank} during init: {ex}")
+            return
+
+        tid = threading.current_thread().native_id
+        while True:
+            try:
+                item = iq.get(timeout=0.5)
+            except queue.Empty:
+                if state.shouldstop():
+                    break
+                continue
+            if item is None:
+                break
+            if sendack:
+                oq.put((tid, ThreadParallel._RCVD_MESSAGE, time.time()), block=True)
+            try:
+                out = func(state, item)
+            except Exception as ex:
+                logger.exception(f"Exception in rank {rank}, thread {tid}: {ex}")
+                continue
+            oq.put((tid, ThreadParallel._OUT_MESSAGE, out), block=True)
+        return
 
 
 __all__ = ["gputasks", "ProcessParallel"]
