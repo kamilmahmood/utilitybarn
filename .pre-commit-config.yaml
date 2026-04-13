@@ -6,13 +6,13 @@ repos:
   - repo: local
     hooks:
       - id: pytest-check
-        name: pytest
+        name: pytest with coverage
         language: python
         require_serial: true
         pass_filenames: false
         always_run: true
         entry: pytest
-        args: [--tb=no]
+        args: [--tb=no, --cov=src/utilitybarn, --cov-fail-under=50, --cov-report=term-missing]
 
       - id: ruff-check
         name: ruff check

@@ -40,6 +40,7 @@ Homepage = "https://github.com/kamilmahmood/utilitybarn"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.4.2",
+  "pytest-cov>=6.0.0",
   "pre-commit>=4.3.0",
   "ruff>=0.14.10",
   "pyright>=1.1.407"
@@ -47,6 +48,28 @@ dev = [
 
 [tool.setuptools.dynamic]
 version = {attr = "utilitybarn.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["src/utilitybarn"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]
 
 [tool.ruff]
 include = ["pyproject.toml", "src/**/*.py", "tests/**/*.py"]
